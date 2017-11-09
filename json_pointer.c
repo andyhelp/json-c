@@ -79,35 +79,6 @@ check_oob:
 	return 1;
 }
 
-static int json_pointer_get_single_path(struct json_object *obj, char *path, struct json_object **value)
-{
-	if (json_object_is_type(obj, json_type_array)) {
-		int32_t idx;
-		if (!is_valid_index(obj, path, &idx))
-			return -1;
-		obj = json_object_array_get_idx(obj, idx);
-		if (obj) {
-			if (value)
-				*value = obj;
-			return 0;
-		}
-		/* Entry not found */
-		errno = ENOENT;
-		return -1;
-	}
-
-	/* RFC states that we first must eval all ~1 then all ~0 */
-	string_replace_all_occurrences_with_char(path, "~1", '/');
-	string_replace_all_occurrences_with_char(path, "~0", '~');
-
-	if (!json_object_object_get_ex(obj, path, value)) {
-		errno = ENOENT;
-		return -1;
-	}
-
-	return 0;
-}
-
 static int json_pointer_set_single_path(
 	struct json_object *parent,
 	const char *path,
@@ -134,39 +105,69 @@ static int json_pointer_set_single_path(
 	return -1;
 }
 
-static int json_pointer_get_recursive(
+static int json_pointer_get_value(
 	struct json_object *obj,
 	char *path,
 	struct json_object **value)
 {
-	char *endp;
-	int rc;
+	json_object *tmp = obj;
+	char *tok, *saveptr;
+	int rc = -1;
 
-	/* All paths (on each recursion level must have a leading '/' */
+	/* All paths must have a leading '/' */
 	if (path[0] != '/') {
 		errno = EINVAL;
 		return -1;
 	}
-	path++;
 
-	endp = strchr(path, '/');
-	if (endp)
-		*endp = '\0';
-
-	/* If we err-ed here, return here */
-	if ((rc = json_pointer_get_single_path(obj, path, &obj)))
-		return rc;
-
-	if (endp) {
-		*endp = '/'; /* Put the slash back, so that the sanity check passes on next recursion level */
-		return json_pointer_get_recursive(obj, endp, value);
+	tok = strtok_r(path, "/", &saveptr);
+	if (!tok) {
+		if (!json_object_object_get_ex(obj, "", &tmp)) {
+			errno = ENOENT;
+			return -1;
+		}
 	}
 
-	/* We should be at the end of the recursion here */
-	if (value)
-		*value = obj;
+	while (tok) {
+		if (json_object_get_type(tmp) == json_type_array) {
+			int idx;
 
-	return 0;
+			if (!is_valid_index(tmp, tok, &idx)) {
+				break;
+			}
+			tmp = json_object_array_get_idx(tmp, idx);
+			if (!tmp) {
+				break;
+			}
+		} else {
+			char *key;
+
+			if (!(key = strdup(tok))) {
+				errno = ENOMEM;
+				break;
+			}
+
+			/* RFC states that we first must eval all ~1 then all ~0 */
+			string_replace_all_occurrences_with_char(key, "~1", '/');
+			string_replace_all_occurrences_with_char(key, "~0", '~');
+
+			if (!json_object_object_get_ex(tmp, key, &tmp)) {
+				errno = ENOENT;
+				free(key);
+				break;
+			}
+			free(key);
+		}
+		tok = strtok_r(NULL, "/", &saveptr);
+	}
+
+	if (tok == NULL) {
+		if (value) {
+			*value = tmp;
+		}
+		rc = 0;
+	}
+	return rc;
 }
 
 int json_pointer_get(struct json_object *obj, const char *path, struct json_object **res)
@@ -185,12 +186,12 @@ int json_pointer_get(struct json_object *obj, const char *path, struct json_obje
 		return 0;
 	}
 
-	/* pass a working copy to the recursive call */
+	/* pass a working copy to the call */
 	if (!(path_copy = strdup(path))) {
 		errno = ENOMEM;
 		return -1;
 	}
-	rc = json_pointer_get_recursive(obj, path_copy, res);
+	rc = json_pointer_get_value(obj, path_copy, res);
 	free(path_copy);
 
 	return rc;
@@ -220,7 +221,7 @@ int json_pointer_getf(struct json_object *obj, struct json_object **res, const c
 		goto out;
 	}
 
-	rc = json_pointer_get_recursive(obj, path_copy, res);
+	rc = json_pointer_get_value(obj, path_copy, res);
 out:
 	free(path_copy);
 
@@ -256,13 +257,13 @@ int json_pointer_set(struct json_object **obj, const char *path, struct json_obj
 		return json_pointer_set_single_path(*obj, path, value);
 	}
 
-	/* pass a working copy to the recursive call */
+	/* pass a working copy to the call */
 	if (!(path_copy = strdup(path))) {
 		errno = ENOMEM;
 		return -1;
 	}
 	path_copy[endp - path] = '\0';
-	rc = json_pointer_get_recursive(*obj, path_copy, &set);
+	rc = json_pointer_get_value(*obj, path_copy, &set);
 	free(path_copy);
 
 	if (rc)
@@ -285,7 +286,7 @@ int json_pointer_setf(struct json_object **obj, struct json_object *value, const
 		return -1;
 	}
 
-	/* pass a working copy to the recursive call */
+	/* pass a working copy to the call */
 	va_start(args, path_fmt);
 	rc = vasprintf(&path_copy, path_fmt, args);
 	va_end(args);
@@ -312,7 +313,7 @@ int json_pointer_setf(struct json_object **obj, struct json_object *value, const
 	}
 
 	*endp = '\0';
-	rc = json_pointer_get_recursive(*obj, path_copy, &set);
+	rc = json_pointer_get_value(*obj, path_copy, &set);
 
 	if (rc)
 		goto out;
